@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fullscreen Drawing App with Recognition</title>
+    <style>
+      body,
+      html {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        width: 100%;
+        height: 100%;
+        font-family: monospace;
+      }
+      #openingScreen {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-color: #f0f0f0;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+      }
+      #startButton {
+        font-size: 24px;
+        padding: 15px 30px;
+        cursor: pointer;
+        background-color: #4a90e2;
+        color: white;
+        border: none;
+        font-family: monospace;
+      }
+      #drawingApp {
+        display: none;
+      }
+      canvas {
+        display: block;
+        touch-action: none;
+      }
+      #controls {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 10;
+      }
+      #controls button {
+        font-family: monospace;
+        padding: 10px;
+        margin-right: 10px;
+        font-size: 16px;
+        cursor: pointer;
+        border: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="openingScreen">
+      <button id="startButton">[start]</button>
+    </div>
+    <div id="drawingApp">
+      <canvas id="drawingCanvas"></canvas>
+      <div id="controls">
+        <button id="refreshBtn">[refresh]</button>
+        <button id="clearBtn">[clear]</button>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        // Establish the root object, `window` (`self`) in the browser,
+        // or `this` in some virtual machines. We use `self`
+        // instead of `window` for `WebWorker` support.
+        var root =
+          (typeof self === "object" && self.self === self && self) || this;
+
+        // Create a safe reference to the handwriting object for use below.
+        var handwriting = function (obj) {
+          if (obj instanceof handwriting) return obj;
+          if (!(this instanceof handwriting)) return new handwriting(obj);
+          this._wrapped = obj;
+        };
+
+        root.handwriting = handwriting;
+
+        handwriting.recognize = function (trace, options, callback) {
+          if (handwriting.Canvas && this instanceof handwriting.Canvas) {
+            trace = this.trace;
+            options = this.options;
+            callback = this.callback;
+          } else if (!options) options = {};
+          var data = JSON.stringify({
+            options: "enable_pre_space",
+            requests: [
+              {
+                writing_guide: {
+                  writing_area_width: options.width || this.width || undefined,
+                  writing_area_height:
+                    options.height || this.width || undefined,
+                },
+                ink: trace,
+                language: options.language || "zh_TW",
+              },
+            ],
+          });
+          var xhr = new XMLHttpRequest();
+          xhr.addEventListener("readystatechange", function () {
+            if (this.readyState === 4) {
+              switch (this.status) {
+                case 200:
+                  var response = JSON.parse(this.responseText);
+                  var results;
+                  if (response.length === 1)
+                    callback(undefined, new Error(response[0]));
+                  else results = response[1][0][1];
+                  if (!!options.numOfWords) {
+                    results = results.filter(function (result) {
+                      return result.length == options.numOfWords;
+                    });
+                  }
+                  if (!!options.numOfReturn) {
+                    results = results.slice(0, options.numOfReturn);
+                  }
+                  callback(results, undefined);
+                  break;
+                case 403:
+                  callback(undefined, new Error("access denied"));
+                  break;
+                case 503:
+                  callback(
+                    undefined,
+                    new Error("can't connect to recognition server"),
+                  );
+                  break;
+              }
+            }
+          });
+          xhr.open(
+            "POST",
+            "https://www.google.com.tw/inputtools/request?ime=handwriting&app=mobilesearch&cs=1&oe=UTF-8",
+          );
+          xhr.setRequestHeader("content-type", "application/json");
+          xhr.send(data);
+        };
+      })();
+    </script>
+    <script>
+      const openingScreen = document.getElementById("openingScreen");
+      const startButton = document.getElementById("startButton");
+      const drawingApp = document.getElementById("drawingApp");
+      const canvas = document.getElementById("drawingCanvas");
+      const ctx = canvas.getContext("2d");
+      const clearBtn = document.getElementById("clearBtn");
+      const refreshBtn = document.getElementById("refreshBtn");
+      const socket = new WebSocket(`ws://${window.location.host}`);
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === "text" || data.type === "error") {
+          fadeOutDrawing(() => displayRecognizedText(data.content));
+        } else if (data.type === "done") {
+          console.log("Response completed");
+        }
+      };
+
+      let isDrawing = false;
+      let currentStroke = [[], []];
+      let trace = [];
+      let startX, startY;
+      let recognitionTimer;
+      let isTextMode = false;
+      let currentText = "";
+      let textOpacity = 1;
+      let drawingOpacity = 1;
+
+      function startApp() {
+        openingScreen.style.display = "none";
+        drawingApp.style.display = "block";
+        document.documentElement.requestFullscreen().catch((err) => {
+          console.error(
+            `Error attempting to enable fullscreen: ${err.message}`,
+          );
+        });
+        resizeCanvas();
+      }
+
+      function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        redrawCanvas();
+      }
+
+      function startDrawing(e) {
+        if (isTextMode) {
+          isTextMode = false;
+          fadeOutText();
+          // Clear the trace array here
+          trace = [];
+        }
+        isDrawing = true;
+        currentStroke = [[], []];
+        [startX, startY] = getCoordinates(e);
+        ctx.beginPath();
+        ctx.moveTo(startX, startY);
+        addPoint(startX, startY);
+      }
+
+      function stopDrawing(e) {
+        if (isDrawing) {
+          const [endX, endY] = getCoordinates(e);
+
+          if (currentStroke[0].length === 1) {
+            // It's a dot (tap/click)
+            ctx.beginPath();
+            ctx.arc(startX, startY, 4, 0, Math.PI * 2);
+            ctx.fillStyle = "#4a90e2";
+            ctx.fill();
+          }
+
+          isDrawing = false;
+          if (currentStroke[0].length > 0) {
+            trace.push(currentStroke);
+          }
+          clearTimeout(recognitionTimer);
+          recognitionTimer = setTimeout(recognizeHandwriting, 1000);
+        }
+      }
+
+      function draw(e) {
+        if (!isDrawing) return;
+        e.preventDefault(); // Prevent scrolling on touch devices
+        clearTimeout(recognitionTimer);
+        const [x, y] = getCoordinates(e);
+
+        ctx.lineWidth = 8;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = `rgba(74, 144, 226, ${drawingOpacity})`;
+
+        ctx.lineTo(x, y);
+        ctx.stroke();
+
+        addPoint(x, y);
+      }
+
+      function fadeOutDrawing(callback) {
+        let opacity = 1;
+        function animate() {
+          opacity -= 0.05;
+          if (opacity <= 0) {
+            drawingOpacity = 0;
+            callback();
+            drawingOpacity = 1;
+          } else {
+            drawingOpacity = opacity;
+            redrawCanvas();
+            requestAnimationFrame(animate);
+          }
+        }
+        animate();
+      }
+
+      function fadeOutText() {
+        let opacity = 1;
+        function animate() {
+          opacity -= 0.05;
+          if (opacity <= 0) {
+            textOpacity = 0;
+            drawingOpacity = 1;
+            redrawCanvas();
+          } else {
+            textOpacity = opacity;
+            redrawCanvas();
+            requestAnimationFrame(animate);
+          }
+        }
+        animate();
+      }
+
+      function getCoordinates(e) {
+        if (!e) {
+          console.error("Event is undefined");
+          return [0, 0];
+        }
+
+        const rect = canvas.getBoundingClientRect();
+        let clientX, clientY;
+
+        if (e.type.includes("mouse")) {
+          clientX = e.clientX;
+          clientY = e.clientY;
+        } else if (e.type.includes("touch")) {
+          if (e.touches && e.touches[0]) {
+            clientX = e.touches[0].clientX;
+            clientY = e.touches[0].clientY;
+          } else if (e.changedTouches && e.changedTouches[0]) {
+            clientX = e.changedTouches[0].clientX;
+            clientY = e.changedTouches[0].clientY;
+          } else {
+            console.error("Unable to get touch coordinates");
+            return [0, 0];
+          }
+        } else {
+          console.error("Unknown event type:", e.type);
+          return [0, 0];
+        }
+
+        return [clientX - rect.left, clientY - rect.top];
+      }
+
+      function addPoint(x, y) {
+        currentStroke[0].push(Math.round(x));
+        currentStroke[1].push(Math.round(y));
+      }
+
+      function clearAll() {
+        trace = [];
+        currentText = "";
+        isTextMode = false;
+        textOpacity = 1;
+        drawingOpacity = 1;
+        redrawCanvas();
+      }
+
+      function drawText(text, x, y, maxWidth, fontSize) {
+        const words = text.split(" ");
+        const lineHeight = fontSize * 1.2;
+        let lines = [];
+        let currentLine = "";
+
+        ctx.font = `${fontSize}px monospace`;
+
+        // First, determine how many lines we'll have
+        for (let word of words) {
+          let testLine = currentLine + word + " ";
+          let metrics = ctx.measureText(testLine);
+          let testWidth = metrics.width;
+
+          if (testWidth > maxWidth && currentLine !== "") {
+            lines.push(currentLine.trim());
+            currentLine = word + " ";
+          } else {
+            currentLine = testLine;
+          }
+        }
+        lines.push(currentLine.trim());
+
+        // Calculate total height of the text block
+        const totalHeight = lines.length * lineHeight;
+
+        // Calculate starting Y position to center the text block
+        let startY = y - totalHeight / 2 + lineHeight / 2;
+
+        // Now draw each line
+        for (let line of lines) {
+          ctx.fillText(line, x, startY);
+          startY += lineHeight;
+        }
+      }
+
+      function displayRecognizedText(text) {
+        isTextMode = true;
+        currentText = text;
+        textOpacity = 1;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Set up text style
+        ctx.fillStyle = `rgba(74, 144, 226, ${textOpacity})`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+
+        // Calculate initial font size
+        let fontSize = Math.min(canvas.width, canvas.height) / 10;
+        let maxWidth = canvas.width * 0.8; // 80% of canvas width
+
+        // Adjust font size based on text length
+        if (text.length > 50) {
+          fontSize *= 50 / text.length;
+        }
+
+        fontSize = Math.max(fontSize, 16); // Ensure minimum font size
+        ctx.font = `${fontSize}px Arial`;
+
+        // Draw the wrapped text
+        drawText(text, canvas.width / 2, canvas.height / 2, maxWidth, fontSize);
+      }
+
+      function redrawCanvas() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (isTextMode) {
+          displayRecognizedText(currentText);
+        } else {
+          trace.forEach((stroke) => {
+            if (stroke[0].length === 1) {
+              ctx.beginPath();
+              ctx.arc(stroke[0][0], stroke[1][0], 4, 0, Math.PI * 2);
+              ctx.fillStyle = `rgba(0, 0, 0, ${drawingOpacity})`;
+              ctx.fill();
+            } else {
+              ctx.beginPath();
+              ctx.moveTo(stroke[0][0], stroke[1][0]);
+              for (let i = 1; i < stroke[0].length; i++) {
+                ctx.lineTo(stroke[0][i], stroke[1][i]);
+              }
+              ctx.lineWidth = 8;
+              ctx.lineCap = "round";
+              ctx.lineJoin = "round";
+              ctx.strokeStyle = `rgba(0, 0, 0, ${drawingOpacity})`;
+              ctx.stroke();
+            }
+          });
+        }
+      }
+
+      function recognizeHandwriting() {
+        var options = {
+          width: canvas.width,
+          height: canvas.height,
+          numOfReturn: 1,
+        };
+
+        handwriting.recognize(trace, options, function (res, err) {
+          if (err) {
+            console.error("Recognition error:", err);
+            if (res && res.length > 0) {
+              fadeOutDrawing(() => displayRecognizedText(err));
+            }
+          } else {
+            console.log("Recognition result:", res);
+            if (res && res.length > 0) {
+              socket.send(
+                JSON.stringify({
+                  type: "text",
+                  content: res[0],
+                }),
+              );
+            }
+          }
+        });
+      }
+
+      startButton.addEventListener("click", startApp);
+      window.addEventListener("resize", resizeCanvas);
+      canvas.addEventListener("mousedown", startDrawing);
+      canvas.addEventListener("mousemove", draw);
+      canvas.addEventListener("mouseup", stopDrawing);
+      canvas.addEventListener("mouseout", stopDrawing);
+      canvas.addEventListener("touchstart", startDrawing);
+      canvas.addEventListener("touchmove", draw);
+      canvas.addEventListener("touchend", stopDrawing);
+      clearBtn.addEventListener("click", clearAll);
+      refreshBtn.addEventListener("click", () => {
+        window.location.reload();
+      });
+    </script>
+  </body>
+</html>
