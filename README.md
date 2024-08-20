@@ -1,5 +1,7 @@
 # kayvee
 
+![9mk6hhlb6qjd1](https://github.com/user-attachments/assets/be33786a-bb8a-4012-a342-2edcd360d03d)
+
 ### Setup
 
 Download ollama, qwen2 and bun
